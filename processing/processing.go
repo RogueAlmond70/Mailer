@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/mail"
+	"time"
 
 	"github.com/Mailer/internal"
 	"github.com/nats-io/nats.go"
@@ -14,12 +15,13 @@ import (
 )
 
 var (
-	ErrNoId        = errors.New("ID not provided in email")
-	ErrNoRecipient = errors.New("no email recipient")
-	ErrNoSender    = errors.New("no sender")
-	ErrNoTemplate  = errors.New("no email template")
-	ErrNoBody      = errors.New("no email body")
-	ErrDuplicateId = errors.New("duplicate email id")
+	ErrNoId                   = errors.New("ID not provided in email")
+	ErrNoRecipient            = errors.New("no email recipient")
+	ErrNoSender               = errors.New("no sender")
+	ErrNoTemplate             = errors.New("no email template")
+	ErrNoBody                 = errors.New("no email body")
+	ErrDuplicateId            = errors.New("duplicate email id")
+	ErrMaxSendAttemptsReached = errors.New("maximum send attempts reached")
 )
 
 type Mailer struct {
@@ -43,6 +45,13 @@ type Attachment struct { // This type will need to be exported and used by all o
 	Content     []byte `json:"content"`
 	ContentID   string `json:"content_id,omitempty"` // for embedded content, this is the position within the email
 	Inline      bool   `json:"inline,omitempty"`
+}
+
+type DeadLetter struct {
+	OriginalMessage EmailRequest
+	FailureReason   string
+	Attempts        int
+	FailedAt        time.Time
 }
 
 func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
@@ -75,7 +84,7 @@ func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
 		return fmt.Errorf("failed to handle message: %w", ErrNoBody)
 	}
 
-	duplicate, err := isDuplicate(ctx, m.logger, request.ID, m.db)
+	duplicate, err := m.isDuplicate(ctx, request.ID)
 	if err != nil {
 		m.logger.Error("failed to handle message, sending to dead letter queue", "error", ErrDuplicateId)
 		return fmt.Errorf("faled to handle message, sending to dead letter queue: %w", ErrDuplicateId)
@@ -148,8 +157,23 @@ func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //
 	err := m.emailAttemptLoop(ctx, 1, maxAttempts, msg, d)
 	if err != nil {
 		m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
-
+		// check error type to see if we need to forward to DLQ
+		if errors.Is(err, ErrMaxSendAttemptsReached) {
+			deadLetter := DeadLetter{
+				OriginalMessage: request,
+				FailureReason:   err.Error(),
+				Attempts:        maxAttempts,
+				FailedAt:        time.Now(),
+			}
+			m.logger.Info("forwarding email to dead letter queue", "request ID", request.ID, "attempts")
+			err := m.addToDeadLetterQueue(ctx, deadLetter)
+			if err != nil {
+				m.logger.Error("failed housekeeping after failed send attempt", "request ID", request.ID, "error", err)
+				return fmt.Errorf("failed housekeeping after failed send attempt %w", err)
+			}
+		}
 	}
+	m.logger.Info("successfully sent email", "request ID", request.ID)
 	return nil
 }
 
@@ -164,8 +188,9 @@ func (m *Mailer) emailAttemptLoop(ctx context.Context, attempt int, maxTries int
 		if attempt < maxTries {
 			m.emailAttemptLoop(ctx, attempt, maxTries, msg, d)
 		}
-		m.logger.Error("email not sent - maximum end attempts reached. Forwarding to dead letter queue")
-		return fmt.Errorf("email not sent - maximum send attempts reached. Forwarding to dead letter queue")
+		m.logger.Error("email not sent - maximum send attempts reached.")
+
+		return ErrMaxSendAttemptsReached
 	}
 	return nil
 }
@@ -187,7 +212,7 @@ func (m *Mailer) isDuplicate(ctx context.Context, ID string) (bool, error) {
 	return false, nil
 }
 
-func (m *Mailer) addToDeadLetterQueue(ctx context.Context, request EmailRequest) error {
+func (m *Mailer) addToDeadLetterQueue(ctx context.Context, deadLetter DeadLetter) error {
 	// Add problem email to dead letter queue for later investigation
 	return nil
 }

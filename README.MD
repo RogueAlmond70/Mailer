@@ -163,3 +163,15 @@ I'd start with the smallest end-to-end path:
 - DLQ implementation
 - provider failure classification
 - concurrency limits
+
+/\*
+Fix the retry recursion and failure-path handling.
+
+Implement NATS consumption and event publishing.
+
+Implement the database methods (duplicate checking, DLQ storage, sent records).
+
+Wire everything together in main.
+
+Test the end-to-end flow.
+\*/

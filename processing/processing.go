@@ -174,6 +174,8 @@ func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //
 		}
 	}
 	m.logger.Info("successfully sent email", "request ID", request.ID)
+	// publish success event for request ID
+	// update sent database with reqquest ID
 	return nil
 }
 
@@ -183,13 +185,15 @@ func (m *Mailer) emailAttemptLoop(ctx context.Context, attempt int, maxTries int
 		return fmt.Errorf("email not sent %w", ctx.Err())
 	}
 	err := d.DialAndSend(msg)
-	attempt++
 	if err != nil {
-		if attempt < maxTries {
-			m.emailAttemptLoop(ctx, attempt, maxTries, msg, d)
+		for attempt < maxTries {
+			attempt++
+			err = d.DialAndSend(msg)
+			if err == nil {
+				return nil
+			}
 		}
 		m.logger.Error("email not sent - maximum send attempts reached.")
-
 		return ErrMaxSendAttemptsReached
 	}
 	return nil
@@ -213,6 +217,22 @@ func (m *Mailer) isDuplicate(ctx context.Context, ID string) (bool, error) {
 }
 
 func (m *Mailer) addToDeadLetterQueue(ctx context.Context, deadLetter DeadLetter) error {
-	// Add problem email to dead letter queue for later investigation
+	if ctx.Err() != nil {
+		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", ctx.Err())
+		return fmt.Errorf("failed to add to dead letter queue %w", ctx.Err())
+	}
+
+	dl, err := json.Marshal(deadLetter)
+	if err != nil {
+		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
+		return fmt.Errorf("failed to add to dead letter queue %w", err)
+	}
+	err = m.db.UploadDeadLetter(ctx, deadLetter.OriginalMessage.ID, dl)
+	if err != nil {
+		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
+		return fmt.Errorf("failed to add to dead letter queue %w", err)
+	}
+	m.logger.Info("Sent failed email to dead letter queue", "request ID", deadLetter.OriginalMessage.ID)
+
 	return nil
 }

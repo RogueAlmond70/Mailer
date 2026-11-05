@@ -2,23 +2,43 @@ package main
 
 import (
 	"context"
-	"time"
+	"log/slog"
+	"os"
 
-	nats "github.com/Mailer/NATS"
-	"go.uber.org/zap"
+	pubSub "github.com/Mailer/PubSub"
+	"github.com/Mailer/internal"
+	"github.com/Mailer/processing"
+	"github.com/Mailer/storage"
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
-	logger, err := zap.NewProduction()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	js, err := pubSub.Setup(logger, ctx)
 	if err != nil {
-		// decide how you want to handle this error
+		logger.Error("failed to setup nats jetstream", "error", err)
+		os.Exit(2)
 	}
-	defer logger.Sync() // Flush buggered log writes to file when program exits
-	//logger.Info("failed to do thing - this is an illustration obvs", zap.String("url", url), zap.Int("attempt", 3), zap.Duration("backoff", time.Second))
 
-	jetstream, err := nats.Setup(logger, ctx)
+	cfg, err := internal.LoadConfig()
+	if err != nil {
+		logger.Error("failed to load config", "error", err)
+		os.Exit(2)
+	}
+
+	db, err := storage.ConnectToDB()
+	if err != nil {
+		logger.Error("failed to create database connection", "error", err)
+		os.Exit(2)
+	}
+
+	mailer := processing.CreateMailer(ctx, logger, *cfg, db, js)
+
+	// Set up listen group for jetstream with subject "mailer"
+	// Create child context with 60 second lifespan
+
+	// use handler mailer.handleMessage()
 
 }

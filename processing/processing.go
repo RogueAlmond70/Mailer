@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mailer/internal"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/gomail.v2"
 )
 
@@ -28,6 +29,7 @@ type Mailer struct {
 	logger internal.Logger
 	cfg    internal.Config
 	db     internal.Database
+	js     jetstream.Stream
 }
 
 type EmailRequest struct { // This type will need to be exported and used by all our other services
@@ -52,6 +54,16 @@ type DeadLetter struct {
 	FailureReason   string
 	Attempts        int
 	FailedAt        time.Time
+}
+
+func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Config, db internal.Database, js jetstream.Stream) *Mailer {
+	mailer := Mailer{
+		logger: logger,
+		cfg:    cfg,
+		db:     db,
+		js:     js,
+	}
+	return &mailer
 }
 
 func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {

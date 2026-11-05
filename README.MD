@@ -165,8 +165,6 @@ I'd start with the smallest end-to-end path:
 - concurrency limits
 
 /\*
-Fix the retry recursion and failure-path handling.
-
 Implement NATS consumption and event publishing.
 
 Implement the database methods (duplicate checking, DLQ storage, sent records).

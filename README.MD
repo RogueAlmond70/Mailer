@@ -45,7 +45,7 @@ Basic architecture:
                                   ┌────────────────────┐
                                   │ Idempotency check  │
                                   │                    │
-                                  │ message ID         │
+                                  │ request ID         │
                                   └─────────┬──────────┘
                                             │
                                   already sent?

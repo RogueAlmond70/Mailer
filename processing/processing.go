@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/mail"
 
 	"github.com/Mailer/internal"
 	"github.com/nats-io/nats.go"
@@ -25,7 +26,6 @@ type EmailRequest struct { // This type will need to be exported and used by all
 	ID         string     `json:"id"`
 	From       string     `json:"from"`
 	To         string     `json:"to"`
-	Cc         string     `json:"cc,omitempty"`
 	Subject    string     `json:"subject"`
 	Body       string     `json:"data"`
 	Attachment Attachment `json:"attachment"`
@@ -39,16 +39,12 @@ type Attachment struct { // This type will need to be exported and used by all o
 	Inline      bool   `json:"inline,omitempty"`
 }
 
-// This returns the string attachment type, the attachment decoded from base64 to its original type, and an error
-func processAttachment(ctx context.Context, logger internal.Logger, attachment Attachment) (string, any, error) {
-	if ctx.Err != nil {
-		logger.Error("failed to process attachment", "error", ctx.Err)
-		return "", -1, fmt.Errorf("failed to process attachment: %w", ctx.Err())
+func handleMessage(ctx context.Context, logger internal.Logger, DB internal.Database, msg *nats.Msg, cfg internal.Config) error {
+	if ctx.Err() != nil {
+		logger.Error("failed to handle message", "error", ctx.Err())
+		return fmt.Errorf("failed to handle message %w", ctx.Err())
 	}
 
-}
-
-func handleMessage(ctx context.Context, logger internal.Logger, DB internal.Database, msg *nats.Msg) error {
 	var request EmailRequest
 
 	err := json.Unmarshal(msg.Data, &request)
@@ -73,7 +69,7 @@ func handleMessage(ctx context.Context, logger internal.Logger, DB internal.Data
 		return fmt.Errorf("failed to handle message: %w", ErrNoBody)
 	}
 
-	duplicate, err := IsDuplicate(ctx, logger, request.ID, DB)
+	duplicate, err := isDuplicate(ctx, logger, request.ID, DB)
 	if err != nil {
 		logger.Error("failed to handle message, sending to dead letter queue", "error", ErrDuplicateId)
 		return fmt.Errorf("faled to handle message, sending to dead letter queue: %w", ErrDuplicateId)
@@ -83,48 +79,108 @@ func handleMessage(ctx context.Context, logger internal.Logger, DB internal.Data
 		return fmt.Errorf("failed to handle message: %w", ErrDuplicateId)
 	}
 	// Message is fine and not duplicate, so we send, or forward to a sending process
+	err = validateEmail(ctx, logger, request)
+	if err != nil {
+		logger.Error("failed to handle message", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failed to handle message: %w", err)
+	}
+
+	err = sendEmail(ctx, logger, request, cfg)
+	if err != nil {
+		logger.Error("failed to handle message", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failed to handle message %w", err)
+	}
 
 	return nil
 }
 
-func validateEmail(ctx context.Context, request EmailRequest) error {
-	// Implement email validation
+func validateEmail(ctx context.Context, logger internal.Logger, request EmailRequest) error {
+	if ctx.Err() != nil {
+		logger.Error("failed to validiate email", "request ID", request.ID, "error", ctx.Err())
+		return fmt.Errorf("failet to validate email: %w", ctx.Err())
+	}
+	_, err := mail.ParseAddress(request.From)
+	if err != nil {
+		logger.Error("failed to validate email", "request ID", request.ID, "email", request.From, "error", err)
+		return fmt.Errorf("failed to validate 'From' email: %w", err)
+	}
+	_, err = mail.ParseAddress(request.To)
+	if err != nil {
+		logger.Error("failed to validate email", "request ID", request.ID, "email", request.To, "error", err)
+		return fmt.Errorf("failed to validate 'To' email: %w", err)
+	}
 
 	return nil
 }
 
-func SendEmail(ctx context.Context, logger internal.Logger, request EmailRequest) error { //WIP
+func sendEmail(ctx context.Context, logger internal.Logger, request EmailRequest, cfg internal.Config) error { //WIP
+	if ctx.Err() != nil {
+		logger.Error("failed to send email", "request ID", request.ID)
+	}
 	m := gomail.NewMessage()
-	m.SetHeader("From", request.From)
+	m.SetHeader("From", request.From) // This will be the email we set up for our Mailer Service
 	m.SetHeader("To", request.To)
-	m.SetHeader("Subject")
+	m.SetHeader("Subject", request.Subject)
 	m.SetBody("text/html", request.Body)
 
 	if request.Attachment.Filename != "" {
 		m.Attach(request.Attachment.Filename, gomail.SetCopyFunc(func(w io.Writer) error {
 			_, err := w.Write([]byte(request.Attachment.Content))
 			if err != nil {
-				logger.Error("failed to send mail", "message ID", request.ID, "error", err)
+				logger.Error("failed to send mail", "request ID", request.ID, "error", err)
 				err = fmt.Errorf("failed to send mail: %w", err)
 			}
 			return err
 		}))
 	}
 
-	d := gomail.NewDialer("smptp.example.com", 587, "user", "123445")
+	d := gomail.NewDialer(cfg.MailerHost, cfg.MailerPort, cfg.MailerUsername, cfg.MailerPassword)
 
 	// send the email
+	maxAttempts := 10
+
+	for i := 0; i < maxAttempts; i++ {
+
+	}
+	// set retry counter
+	retries := 0
+	// Try to send
+	err := d.DialAndSend(m)
+	// If it fails, try again, checking each time for failure, until a max retry limit has been reached
+	if err != nil {
+		// check retry limit
+		if retries < maxAttempts {
+
+		}
+	}
+
 	err := d.DialAndSend(m)
 	if err != nil {
-		logger.Error("failed to send email", "message ID", request.ID, "error", err)
+		logger.Error("failed to send email", "request ID", request.ID, "error", err)
 		return fmt.Errorf("failed to send email: %w", err)
 	}
 
 	return nil
 }
 
+func emailAttemptLoop(attempt int, maxTries int, m *gomail.Message, d *gomail.Dialer) {
+	err := d.DialAndSend(m)
+	attempt++
+	if err != nil {
+		if attempt < maxTries {
+			emailAttemptLoop(attempt, maxTries, m, d)
+		}
+
+	}
+	return nil
+}
+
 // Checks against the database
-func IsDuplicate(ctx context.Context, logger internal.Logger, ID string, DB internal.Database) (bool, error) {
+func isDuplicate(ctx context.Context, logger internal.Logger, ID string, DB internal.Database) (bool, error) {
+	if ctx.Err() != nil {
+		logger.Error("failed to check for duplicate email id", "error", ctx.Err())
+		return false, fmt.Errorf("failed to check for duplicate email id %w", ctx.Err())
+	}
 	duplicate, err := DB.IsDuplicate(ctx, ID)
 	if err != nil {
 		logger.Error("failed to check for duplicate email id", "error", err)

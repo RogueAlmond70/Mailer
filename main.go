@@ -29,7 +29,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	db, err := storage.ConnectToDB()
+	db, err := storage.ConnectToDB(ctx, logger, *cfg)
 	if err != nil {
 		logger.Error("failed to create database connection", "error", err)
 		os.Exit(2)

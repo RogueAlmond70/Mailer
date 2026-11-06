@@ -52,10 +52,10 @@ type Attachment struct { // This type will need to be exported and used by all o
 }
 
 type DeadLetter struct {
-	OriginalMessage EmailRequest
-	FailureReason   string
-	Attempts        int
-	FailedAt        time.Time
+	OriginalMessage EmailRequest `json:"original_message"`
+	FailureReason   string       `json:"failure_reason"`
+	Attempts        int          `json:"attempts"`
+	FailedAt        time.Time    `json:"failed_at"`
 }
 
 func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Config, db internal.Database, stream jetstream.Stream, js jetstream.JetStream) *Mailer {
@@ -266,7 +266,7 @@ func (m *Mailer) addToDeadLetterQueue(ctx context.Context, deadLetter DeadLetter
 		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
 		return fmt.Errorf("failed to add to dead letter queue %w", err)
 	}
-	err = m.db.UploadDeadLetter(ctx, deadLetter.OriginalMessage.ID, dl)
+	err = m.db.UploadDeadLetter(ctx, dl)
 	if err != nil {
 		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
 		return fmt.Errorf("failed to add to dead letter queue %w", err)

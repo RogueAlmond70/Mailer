@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Mailer/internal"
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/gomail.v2"
 )
@@ -21,6 +20,7 @@ var (
 	ErrNoSender               = errors.New("no sender")
 	ErrNoTemplate             = errors.New("no email template")
 	ErrNoBody                 = errors.New("no email body")
+	ErrNoService              = errors.New("no requesting service specified")
 	ErrDuplicateId            = errors.New("duplicate email id")
 	ErrMaxSendAttemptsReached = errors.New("maximum send attempts reached")
 )
@@ -34,6 +34,7 @@ type Mailer struct {
 }
 
 type EmailRequest struct { // This type will need to be exported and used by all our other services
+	Service    string     `json:"service"`
 	ID         string     `json:"id"`
 	From       string     `json:"from"`
 	To         string     `json:"to"`
@@ -68,7 +69,7 @@ func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Conf
 	return &mailer
 }
 
-func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
+func (m *Mailer) HandleMessage(ctx context.Context, data []byte) error {
 	err := ctx.Err()
 	if err != nil {
 		m.logger.Error("failed to handle message", "error", err)
@@ -77,10 +78,13 @@ func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
 
 	var request EmailRequest
 
-	err = json.Unmarshal(msg.Data, &request)
+	err = json.Unmarshal(data, &request)
 	if err != nil {
 		m.logger.Error("failed to unmarshal payload", "error", err)
 		return fmt.Errorf("failed to unmarshal payload: %w", err)
+	}
+	if request.Service == "" {
+		m.logger.Error("failed to handle message", "error", ErrNoService)
 	}
 	if request.ID == "" {
 		m.logger.Error("failed to handle message", "error", ErrNoId)
@@ -99,7 +103,10 @@ func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
 		return fmt.Errorf("failed to handle message: %w", ErrNoBody)
 	}
 
-	duplicate, err := m.isDuplicate(ctx, request.ID)
+	childCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	duplicate, err := m.isDuplicate(childCtx, request.ID)
 	if err != nil {
 		m.logger.Error("failed to handle message, sending to dead letter queue", "error", ErrDuplicateId)
 		return fmt.Errorf("faled to handle message, sending to dead letter queue: %w", ErrDuplicateId)
@@ -109,13 +116,13 @@ func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
 		return fmt.Errorf("failed to handle message: %w", ErrDuplicateId)
 	}
 	// Message is fine and not duplicate, so we send, or forward to a sending process
-	err = m.validateEmail(ctx, request)
+	err = m.validateEmail(childCtx, request)
 	if err != nil {
 		m.logger.Error("failed to handle message", "request ID", request.ID, "error", err)
 		return fmt.Errorf("failed to handle message: %w", err)
 	}
 
-	err = m.sendEmail(ctx, request)
+	err = m.sendEmail(childCtx, request)
 	if err != nil {
 		m.logger.Error("failed to handle message", "request ID", request.ID, "error", err)
 		return fmt.Errorf("failed to handle message %w", err)
@@ -197,7 +204,7 @@ func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //
 		m.logger.Error("failed to publish success event", "request ID", request.ID, "error", err)
 		return fmt.Errorf("failed to publish success event %w", err)
 	}
-	ack, err := m.js.Publish(ctx, "email success", req)
+	ack, err := m.js.Publish(ctx, request.Service, req) //TODO: think of a useful subject name that includes the request.Service
 	m.logger.Info("message published", "stream", ack.Stream, "sequence", ack.Sequence)
 
 	err = m.db.StoreEmailRecord(ctx, req)

@@ -9,6 +9,7 @@ import (
 	"github.com/Mailer/internal"
 	"github.com/Mailer/processing"
 	"github.com/Mailer/storage"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 func main() {
@@ -37,8 +38,28 @@ func main() {
 	mailer := processing.CreateMailer(ctx, logger, *cfg, db, stream, js)
 
 	// Set up listen group for jetstream with subject "mailer"
-	// Create child context with 60 second lifespan
 
-	// use handler mailer.handleMessage()
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       "mailer-worker",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxDeliver:    5,
+		FilterSubject: "mailer.send",
+	})
+
+	_, err = consumer.Consume(func(msg jetstream.Msg) {
+		logger.Info("Received:", msg.Subject())
+
+		err := mailer.HandleMessage(ctx, msg.Data())
+		if err != nil {
+			logger.Error("failed to consume message", "error", err)
+			msg.Nak()
+			return
+		}
+		msg.Ack()
+	})
+	if err != nil {
+		logger.Error("failed to create consumer for jetstream %w", err)
+		os.Exit(2)
+	}
 
 }

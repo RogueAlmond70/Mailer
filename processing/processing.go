@@ -29,7 +29,8 @@ type Mailer struct {
 	logger internal.Logger
 	cfg    internal.Config
 	db     internal.Database
-	js     jetstream.Stream
+	stream jetstream.Stream
+	js     jetstream.JetStream
 }
 
 type EmailRequest struct { // This type will need to be exported and used by all our other services
@@ -56,25 +57,27 @@ type DeadLetter struct {
 	FailedAt        time.Time
 }
 
-func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Config, db internal.Database, js jetstream.Stream) *Mailer {
+func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Config, db internal.Database, stream jetstream.Stream, js jetstream.JetStream) *Mailer {
 	mailer := Mailer{
 		logger: logger,
 		cfg:    cfg,
 		db:     db,
+		stream: stream,
 		js:     js,
 	}
 	return &mailer
 }
 
 func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
-	if ctx.Err() != nil {
-		m.logger.Error("failed to handle message", "error", ctx.Err())
-		return fmt.Errorf("failed to handle message %w", ctx.Err())
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("failed to handle message", "error", err)
+		return fmt.Errorf("failed to handle message %w", err)
 	}
 
 	var request EmailRequest
 
-	err := json.Unmarshal(msg.Data, &request)
+	err = json.Unmarshal(msg.Data, &request)
 	if err != nil {
 		m.logger.Error("failed to unmarshal payload", "error", err)
 		return fmt.Errorf("failed to unmarshal payload: %w", err)
@@ -122,11 +125,12 @@ func (m *Mailer) handleMessage(ctx context.Context, msg *nats.Msg) error {
 }
 
 func (m *Mailer) validateEmail(ctx context.Context, request EmailRequest) error {
-	if ctx.Err() != nil {
-		m.logger.Error("failed to validiate email", "request ID", request.ID, "error", ctx.Err())
-		return fmt.Errorf("failet to validate email: %w", ctx.Err())
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("failed to validiate email", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failet to validate email: %w", err)
 	}
-	_, err := mail.ParseAddress(request.From)
+	_, err = mail.ParseAddress(request.From)
 	if err != nil {
 		m.logger.Error("failed to validate email", "request ID", request.ID, "email", request.From, "error", err)
 		return fmt.Errorf("failed to validate 'From' email: %w", err)
@@ -141,8 +145,10 @@ func (m *Mailer) validateEmail(ctx context.Context, request EmailRequest) error 
 }
 
 func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //WIP
-	if ctx.Err() != nil {
-		m.logger.Error("failed to send email", "request ID", request.ID)
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failed to send email %w", err)
 	}
 	msg := gomail.NewMessage()
 	msg.SetHeader("From", request.From) // This will be the email we set up for our Mailer Service
@@ -163,13 +169,12 @@ func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //
 
 	d := gomail.NewDialer(m.cfg.MailerHost, m.cfg.MailerPort, m.cfg.MailerUsername, m.cfg.MailerPassword)
 
-	// send the email
 	maxAttempts := 10
 
-	err := m.emailAttemptLoop(ctx, 1, maxAttempts, msg, d)
+	err = m.emailAttemptLoop(ctx, 1, maxAttempts, msg, d)
 	if err != nil {
 		m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
-		// check error type to see if we need to forward to DLQ
+
 		if errors.Is(err, ErrMaxSendAttemptsReached) {
 			deadLetter := DeadLetter{
 				OriginalMessage: request,
@@ -186,17 +191,30 @@ func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //
 		}
 	}
 	m.logger.Info("successfully sent email", "request ID", request.ID)
-	// publish success event for request ID
-	// update sent database with reqquest ID
+
+	req, err := json.Marshal(request)
+	if err != nil {
+		m.logger.Error("failed to publish success event", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failed to publish success event %w", err)
+	}
+	ack, err := m.js.Publish(ctx, "email success", req)
+	m.logger.Info("message published", "stream", ack.Stream, "sequence", ack.Sequence)
+
+	err = m.db.StoreEmailRecord(ctx, req)
+	if err != nil {
+		m.logger.Error("failed to save successful email request to database", "request ID", request.ID, "error", err)
+		return fmt.Errorf("failed to save successful email request to database %w", err)
+	}
 	return nil
 }
 
 func (m *Mailer) emailAttemptLoop(ctx context.Context, attempt int, maxTries int, msg *gomail.Message, d *gomail.Dialer) error {
-	if ctx.Err() != nil {
-		m.logger.Error("email not sent", "error", ctx.Err())
-		return fmt.Errorf("email not sent %w", ctx.Err())
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("email not sent", "error", err)
+		return fmt.Errorf("email not sent %w", err)
 	}
-	err := d.DialAndSend(msg)
+	err = d.DialAndSend(msg)
 	if err != nil {
 		for attempt < maxTries {
 			attempt++
@@ -213,9 +231,10 @@ func (m *Mailer) emailAttemptLoop(ctx context.Context, attempt int, maxTries int
 
 // Checks against the database
 func (m *Mailer) isDuplicate(ctx context.Context, ID string) (bool, error) {
-	if ctx.Err() != nil {
-		m.logger.Error("failed to check for duplicate email id", "error", ctx.Err())
-		return false, fmt.Errorf("failed to check for duplicate email id %w", ctx.Err())
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("failed to check for duplicate email id", "error", err)
+		return false, fmt.Errorf("failed to check for duplicate email id %w", err)
 	}
 	duplicate, err := m.db.IsDuplicate(ctx, ID)
 	if err != nil {
@@ -229,9 +248,10 @@ func (m *Mailer) isDuplicate(ctx context.Context, ID string) (bool, error) {
 }
 
 func (m *Mailer) addToDeadLetterQueue(ctx context.Context, deadLetter DeadLetter) error {
-	if ctx.Err() != nil {
-		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", ctx.Err())
-		return fmt.Errorf("failed to add to dead letter queue %w", ctx.Err())
+	err := ctx.Err()
+	if err != nil {
+		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
+		return fmt.Errorf("failed to add to dead letter queue %w", err)
 	}
 
 	dl, err := json.Marshal(deadLetter)

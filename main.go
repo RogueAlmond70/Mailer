@@ -16,7 +16,7 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	js, err := pubSub.Setup(logger, ctx)
+	stream, js, err := pubSub.Setup(logger, ctx)
 	if err != nil {
 		logger.Error("failed to setup nats jetstream", "error", err)
 		os.Exit(2)
@@ -34,7 +34,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	mailer := processing.CreateMailer(ctx, logger, *cfg, db, js)
+	mailer := processing.CreateMailer(ctx, logger, *cfg, db, stream, js)
 
 	// Set up listen group for jetstream with subject "mailer"
 	// Create child context with 60 second lifespan

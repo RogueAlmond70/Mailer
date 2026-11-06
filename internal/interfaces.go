@@ -17,7 +17,8 @@ type Database interface {
 	IsDuplicate(context.Context, string) (bool, error)
 	StoreEmailRecord(context.Context, []byte) error
 	DeleteEmailRecord(context.Context, string) error
-	UploadDeadLetter(context.Context, string, []byte) error
+	UploadDeadLetter(context.Context, []byte) error
+	CreateTableIfNotExists(context.Context) error
 }
 
 type Logger interface {

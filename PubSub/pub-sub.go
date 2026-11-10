@@ -30,7 +30,6 @@ func Setup(logger internal.Logger, ctx context.Context) (jetstream.Stream, jetst
 		Storage:  jetstream.FileStorage,
 	})
 	if err != nil {
-		// use an Errors.Is to check if its because the stream already exists - because if so, that's fine
 		return nil, nil, fmt.Errorf("failed to create stream: %v", err)
 	}
 

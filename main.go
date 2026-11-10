@@ -47,7 +47,7 @@ func main() {
 	})
 
 	_, err = consumer.Consume(func(msg jetstream.Msg) {
-		logger.Info("Received:", msg.Subject())
+		logger.Info("Received:", "message", msg.Subject())
 
 		err := mailer.HandleMessage(ctx, msg.Data())
 		if err != nil {
@@ -58,7 +58,7 @@ func main() {
 		msg.Ack()
 	})
 	if err != nil {
-		logger.Error("failed to create consumer for jetstream %w", err)
+		logger.Error("failed to create consumer for jetstream", "error", err)
 		os.Exit(2)
 	}
 

@@ -1,4 +1,4 @@
-## This mailer service will handle emails being sent out to users of the band builder (or potentially other) app.
+## This mailer service will handle email request events.
 
 Basic architecture:
 

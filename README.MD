@@ -1,3 +1,44 @@
+## How to run
+
+From this directory:
+
+```
+docker compose up --build
+```
+
+That starts NATS with JetStream, Postgres 16, and the mailer. Postgres creates the `mailer` database (user `mailer`, password `mailer`) and, on a fresh volume, loads the schema and seed data. The mailer then listens for `email.send`.
+
+- Health: http://localhost:8080/healthz
+- Metrics: http://localhost:8080/metrics
+- NATS: `localhost:4222`
+- Postgres: `localhost:5432`
+
+### Environment variables
+
+Compose sets the database and NATS values for the mailer container. Running `go run .` on the host uses the defaults below, with `localhost` instead of the Compose hostnames. `MAILER_HOST` has no default. Until it is set, the process still starts and failed sends are dead-lettered.
+
+| Variable | Default | Compose value |
+| --- | --- | --- |
+| `NATS_URL` | `nats://127.0.0.1:4222` | `nats://nats:4222` |
+| `POSTGRES_HOST` | `localhost` | `postgres` |
+| `POSTGRES_PORT` | `5432` | `5432` |
+| `POSTGRES_USER` | empty | `mailer` |
+| `POSTGRES_PASSWORD` | empty | `mailer` |
+| `POSTGRES_DB_NAME` | empty | `mailer` |
+| `POSTGRES_SSL_MODE` | `disable` | `disable` |
+| `METRICS_ADDR` | `:8080` | `:8080` |
+| `MAILER_HOST` | empty | unset |
+| `MAILER_PORT` | `587` | unset |
+| `MAILER_USERNAME` | empty | unset |
+| `MAILER_PASSWORD` | empty | unset |
+| `MAX_SEND_ATTEMPTS` | `3` | unset |
+| `MAX_IN_FLIGHT` | `8` | unset |
+| `MAX_DELIVER` | `5` | unset |
+| `RETRY_BACKOFF` | `200ms` | unset |
+| `REDELIVERY_DELAY` | `2s` | unset |
+| `PROCESSING_TIMEOUT` | `45s` | unset |
+| `ACK_WAIT` | `90s` | unset |
+
 ## This mailer service will handle emails being sent out to users of the band builder (or potentially other) app.
 
 Basic architecture:

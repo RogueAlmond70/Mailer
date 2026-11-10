@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/mail"
 	"time"
 
 	"github.com/Mailer/internal"
-	"github.com/nats-io/nats.go/jetstream"
-	"gopkg.in/gomail.v2"
+	"github.com/Mailer/metrics"
 )
 
 var (
@@ -23,255 +21,270 @@ var (
 	ErrNoService              = errors.New("no requesting service specified")
 	ErrDuplicateId            = errors.New("duplicate email id")
 	ErrMaxSendAttemptsReached = errors.New("maximum send attempts reached")
+	// ErrRedeliver asks the caller to Nak the JetStream message.
+	// A nil return is terminal: the message has been sent, skipped, or dead-lettered, and should be acked.
+	ErrRedeliver = errors.New("redeliver")
 )
 
+const (
+	StatusSent   = "sent"
+	StatusFailed = "failed"
+)
+
+// Publisher emits email.sent and email.failed.
+type Publisher interface {
+	Publish(ctx context.Context, subject string, payload []byte) error
+}
+
+// Outcome is the body published on email.sent and email.failed.
+type Outcome struct {
+	ID      string `json:"id"`
+	Service string `json:"service"`
+	Status  string `json:"status"`
+	Error   string `json:"error,omitempty"`
+}
+
 type Mailer struct {
-	logger internal.Logger
-	cfg    internal.Config
-	db     internal.Database
-	stream jetstream.Stream
-	js     jetstream.JetStream
+	logger    internal.Logger
+	cfg       internal.Config
+	db        internal.Database
+	publisher Publisher
+	sender    Sender
+	metrics   *metrics.Metrics
+	sleepFn   func(context.Context, time.Duration) error
 }
 
-type EmailRequest struct { // This type will need to be exported and used by all our other services
-	Service    string     `json:"service"`
-	ID         string     `json:"id"`
-	From       string     `json:"from"`
-	To         string     `json:"to"`
-	Subject    string     `json:"subject"`
-	Body       string     `json:"data"`
-	Attachment Attachment `json:"attachment"`
-}
-
-type Attachment struct { // This type will need to be exported and used by all our other services
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	Content     []byte `json:"content"`
-	ContentID   string `json:"content_id,omitempty"` // for embedded content, this is the position within the email
-	Inline      bool   `json:"inline,omitempty"`
-}
-
-type DeadLetter struct {
-	OriginalMessage EmailRequest `json:"original_message"`
-	FailureReason   string       `json:"failure_reason"`
-	Attempts        int          `json:"attempts"`
-	FailedAt        time.Time    `json:"failed_at"`
-}
-
-func CreateMailer(ctx context.Context, logger internal.Logger, cfg internal.Config, db internal.Database, stream jetstream.Stream, js jetstream.JetStream) *Mailer {
-	mailer := Mailer{
-		logger: logger,
-		cfg:    cfg,
-		db:     db,
-		stream: stream,
-		js:     js,
+func CreateMailer(logger internal.Logger, cfg internal.Config, db internal.Database, publisher Publisher, sender Sender, m *metrics.Metrics) *Mailer {
+	if m == nil {
+		m = metrics.New()
 	}
-	return &mailer
+	if cfg.MaxSendAttempts < 1 {
+		cfg.MaxSendAttempts = 1
+	}
+	return &Mailer{
+		logger:    logger,
+		cfg:       cfg,
+		db:        db,
+		publisher: publisher,
+		sender:    sender,
+		metrics:   m,
+		sleepFn:   sleep,
+	}
 }
 
+// HandleMessage processes one email.send payload.
+// A nil error means the JetStream message should be acknowledged.
+// ErrRedeliver means it should be negatively acknowledged.
 func (m *Mailer) HandleMessage(ctx context.Context, data []byte) error {
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("failed to handle message", "error", err)
-		return fmt.Errorf("failed to handle message %w", err)
+	start := time.Now()
+	defer func() {
+		m.metrics.Processing.Observe(time.Since(start).Seconds())
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return redeliver(err)
 	}
 
 	var request EmailRequest
-
-	err = json.Unmarshal(data, &request)
-	if err != nil {
-		m.logger.Error("failed to unmarshal payload", "error", err)
-		return fmt.Errorf("failed to unmarshal payload: %w", err)
+	if err := json.Unmarshal(data, &request); err != nil {
+		m.metrics.Failed.Inc()
+		m.logger.Error("dropping invalid payload", "error", err)
+		return nil
 	}
+
+	if err := m.validateEmail(request); err != nil {
+		m.logger.Error("failed to validate email", "request ID", request.ID, "error", err)
+		return m.reject(ctx, request, 1, err)
+	}
+
+	duplicate, err := m.db.IsDuplicate(ctx, request.ID)
+	if err != nil {
+		m.logger.Error("failed to check for duplicate email id", "request ID", request.ID, "error", err)
+		return redeliver(err)
+	}
+	if duplicate {
+		m.metrics.Duplicate.Inc()
+		m.logger.Info("email already sent", "request ID", request.ID)
+		return m.publish(ctx, internal.SubjectSent, request, "")
+	}
+
+	attempts, err := m.sendWithRetry(ctx, request)
+	if err != nil {
+		if errors.Is(err, ErrRedeliver) {
+			return err
+		}
+		m.logger.Error("failed to send email", "request ID", request.ID, "attempts", attempts, "error", err)
+		return m.reject(ctx, request, attempts, err)
+	}
+
+	stored, err := json.Marshal(request)
+	if err != nil {
+		return redeliver(err)
+	}
+	if err := m.db.StoreEmailRecord(ctx, stored); err != nil {
+		if errors.Is(err, internal.ErrAlreadyStored) {
+			m.metrics.Duplicate.Inc()
+			m.logger.Info("email already recorded", "request ID", request.ID)
+			return m.publish(ctx, internal.SubjectSent, request, "")
+		}
+		m.logger.Error("failed to save email record", "request ID", request.ID, "error", err)
+		return redeliver(err)
+	}
+
+	m.metrics.Sent.Inc()
+	m.logger.Info("sent email", "request ID", request.ID)
+	return m.publish(ctx, internal.SubjectSent, request, "")
+}
+
+func (m *Mailer) validateEmail(request EmailRequest) error {
 	if request.Service == "" {
-		m.logger.Error("failed to handle message", "error", ErrNoService)
+		return ErrNoService
 	}
 	if request.ID == "" {
-		m.logger.Error("failed to handle message", "error", ErrNoId)
-		return fmt.Errorf("failed to handle message %w", ErrNoId)
-	}
-	if request.To == "" {
-		m.logger.Error("failed to handle message", "error", ErrNoRecipient)
-		return fmt.Errorf("failed to handle message: %w", ErrNoRecipient)
+		return ErrNoId
 	}
 	if request.From == "" {
-		m.logger.Error("failed to handle message", "error", ErrNoSender)
-		return fmt.Errorf("failed to handle message: %w", ErrNoSender)
+		return ErrNoSender
+	}
+	if request.To == "" {
+		return ErrNoRecipient
 	}
 	if request.Body == "" {
-		m.logger.Error("failed to handle message", "error", ErrNoBody)
-		return fmt.Errorf("failed to handle message: %w", ErrNoBody)
+		return ErrNoBody
 	}
-
-	childCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	duplicate, err := m.isDuplicate(childCtx, request.ID)
-	if err != nil {
-		m.logger.Error("failed to handle message, sending to dead letter queue", "error", ErrDuplicateId)
-		return fmt.Errorf("faled to handle message, sending to dead letter queue: %w", ErrDuplicateId)
-	}
-	if duplicate {
-		m.logger.Error("failed to handle message", ErrDuplicateId)
-		return fmt.Errorf("failed to handle message: %w", ErrDuplicateId)
-	}
-	// Message is fine and not duplicate, so we send, or forward to a sending process
-	err = m.validateEmail(childCtx, request)
-	if err != nil {
-		m.logger.Error("failed to handle message", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failed to handle message: %w", err)
-	}
-
-	err = m.sendEmail(childCtx, request)
-	if err != nil {
-		m.logger.Error("failed to handle message", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failed to handle message %w", err)
-	}
-
-	return nil
-}
-
-func (m *Mailer) validateEmail(ctx context.Context, request EmailRequest) error {
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("failed to validiate email", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failet to validate email: %w", err)
-	}
-	_, err = mail.ParseAddress(request.From)
-	if err != nil {
-		m.logger.Error("failed to validate email", "request ID", request.ID, "email", request.From, "error", err)
+	if _, err := mail.ParseAddress(request.From); err != nil {
 		return fmt.Errorf("failed to validate 'From' email: %w", err)
 	}
-	_, err = mail.ParseAddress(request.To)
-	if err != nil {
-		m.logger.Error("failed to validate email", "request ID", request.ID, "email", request.To, "error", err)
+	if _, err := mail.ParseAddress(request.To); err != nil {
 		return fmt.Errorf("failed to validate 'To' email: %w", err)
 	}
-
 	return nil
 }
 
-func (m *Mailer) sendEmail(ctx context.Context, request EmailRequest) error { //WIP
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failed to send email %w", err)
-	}
-	msg := gomail.NewMessage()
-	msg.SetHeader("From", request.From) // This will be the email we set up for our Mailer Service
-	msg.SetHeader("To", request.To)
-	msg.SetHeader("Subject", request.Subject)
-	msg.SetBody("text/html", request.Body)
-
-	if request.Attachment.Filename != "" {
-		msg.Attach(request.Attachment.Filename, gomail.SetCopyFunc(func(w io.Writer) error {
-			_, err := w.Write([]byte(request.Attachment.Content))
-			if err != nil {
-				m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
-				err = fmt.Errorf("failed to send mail: %w", err)
-			}
-			return err
-		}))
-	}
-
-	d := gomail.NewDialer(m.cfg.MailerHost, m.cfg.MailerPort, m.cfg.MailerUsername, m.cfg.MailerPassword)
-
-	maxAttempts := 10
-
-	err = m.emailAttemptLoop(ctx, 1, maxAttempts, msg, d)
-	if err != nil {
-		m.logger.Error("failed to send email", "request ID", request.ID, "error", err)
-
-		if errors.Is(err, ErrMaxSendAttemptsReached) {
-			deadLetter := DeadLetter{
-				OriginalMessage: request,
-				FailureReason:   err.Error(),
-				Attempts:        maxAttempts,
-				FailedAt:        time.Now(),
-			}
-			m.logger.Info("forwarding email to dead letter queue", "request ID", request.ID, "attempts")
-			err := m.addToDeadLetterQueue(ctx, deadLetter)
-			if err != nil {
-				m.logger.Error("failed housekeeping after failed send attempt", "request ID", request.ID, "error", err)
-				return fmt.Errorf("failed housekeeping after failed send attempt %w", err)
-			}
+func (m *Mailer) sendWithRetry(ctx context.Context, request EmailRequest) (int, error) {
+	var last error
+	attempts := 0
+	for attempts < m.cfg.MaxSendAttempts {
+		if err := ctx.Err(); err != nil {
+			return attempts, redeliver(err)
+		}
+		attempts++
+		m.metrics.Attempts.Inc()
+		err := m.sender.Send(ctx, request)
+		if err == nil {
+			return attempts, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return attempts, redeliver(err)
+		}
+		last = err
+		m.logger.Warn("email send attempt failed", "request ID", request.ID, "attempt", attempts, "error", err)
+		if IsPermanent(err) || attempts >= m.cfg.MaxSendAttempts {
+			break
+		}
+		if err := m.sleepFn(ctx, m.backoff(attempts)); err != nil {
+			return attempts, redeliver(err)
 		}
 	}
-	m.logger.Info("successfully sent email", "request ID", request.ID)
-
-	req, err := json.Marshal(request)
-	if err != nil {
-		m.logger.Error("failed to publish success event", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failed to publish success event %w", err)
+	if IsPermanent(last) {
+		return attempts, last
 	}
-	ack, err := m.js.Publish(ctx, request.Service, req) //TODO: think of a useful subject name that includes the request.Service
-	m.logger.Info("message published", "stream", ack.Stream, "sequence", ack.Sequence)
+	return attempts, fmt.Errorf("%w: %v", ErrMaxSendAttemptsReached, last)
+}
 
-	err = m.db.StoreEmailRecord(ctx, req)
-	if err != nil {
-		m.logger.Error("failed to save successful email request to database", "request ID", request.ID, "error", err)
-		return fmt.Errorf("failed to save successful email request to database %w", err)
+func (m *Mailer) backoff(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
 	}
+	if shift > 5 {
+		shift = 5
+	}
+	return m.cfg.RetryBackoff * time.Duration(1<<shift)
+}
+
+func (m *Mailer) reject(ctx context.Context, request EmailRequest, attempts int, reason error) error {
+	if !canDeadLetter(request) {
+		m.metrics.Failed.Inc()
+		m.logger.Error("dropping invalid message", "request ID", request.ID, "error", reason)
+		return nil
+	}
+
+	letter := DeadLetter{
+		OriginalMessage: request,
+		FailureReason:   reason.Error(),
+		Attempts:        attempts,
+		FailedAt:        time.Now(),
+	}
+	if letter.Attempts < 1 {
+		letter.Attempts = 1
+	}
+	if err := m.addToDeadLetterQueue(ctx, letter); err != nil {
+		m.logger.Error("failed to add to dead letter queue", "request ID", request.ID, "error", err)
+		return redeliver(err)
+	}
+	if err := m.publish(ctx, internal.SubjectFailed, request, reason.Error()); err != nil {
+		return err
+	}
+	m.metrics.Failed.Inc()
 	return nil
 }
 
-func (m *Mailer) emailAttemptLoop(ctx context.Context, attempt int, maxTries int, msg *gomail.Message, d *gomail.Dialer) error {
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("email not sent", "error", err)
-		return fmt.Errorf("email not sent %w", err)
+func (m *Mailer) publish(ctx context.Context, subject string, request EmailRequest, failure string) error {
+	status := StatusSent
+	if subject == internal.SubjectFailed {
+		status = StatusFailed
 	}
-	err = d.DialAndSend(msg)
+	body, err := json.Marshal(Outcome{
+		ID:      request.ID,
+		Service: request.Service,
+		Status:  status,
+		Error:   failure,
+	})
 	if err != nil {
-		for attempt < maxTries {
-			attempt++
-			err = d.DialAndSend(msg)
-			if err == nil {
-				return nil
-			}
-		}
-		m.logger.Error("email not sent - maximum send attempts reached.")
-		return ErrMaxSendAttemptsReached
+		return redeliver(err)
 	}
+	if err := m.publisher.Publish(ctx, subject, body); err != nil {
+		m.logger.Error("failed to publish outcome", "request ID", request.ID, "subject", subject, "error", err)
+		return redeliver(err)
+	}
+	m.logger.Info("published outcome", "request ID", request.ID, "subject", subject)
 	return nil
-}
-
-// Checks against the database
-func (m *Mailer) isDuplicate(ctx context.Context, ID string) (bool, error) {
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("failed to check for duplicate email id", "error", err)
-		return false, fmt.Errorf("failed to check for duplicate email id %w", err)
-	}
-	duplicate, err := m.db.IsDuplicate(ctx, ID)
-	if err != nil {
-		m.logger.Error("failed to check for duplicate email id", "error", err)
-		return false, fmt.Errorf("failed to check for duplicate email id %w", err)
-	}
-	if duplicate {
-		return true, nil
-	}
-	return false, nil
 }
 
 func (m *Mailer) addToDeadLetterQueue(ctx context.Context, deadLetter DeadLetter) error {
-	err := ctx.Err()
-	if err != nil {
-		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
-		return fmt.Errorf("failed to add to dead letter queue %w", err)
-	}
-
 	dl, err := json.Marshal(deadLetter)
 	if err != nil {
-		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
-		return fmt.Errorf("failed to add to dead letter queue %w", err)
+		return fmt.Errorf("failed to add to dead letter queue: %w", err)
 	}
-	err = m.db.UploadDeadLetter(ctx, dl)
-	if err != nil {
-		m.logger.Error("failed to add to dead letter queue", "request ID", deadLetter.OriginalMessage.ID, "error", err)
-		return fmt.Errorf("failed to add to dead letter queue %w", err)
+	if err := m.db.UploadDeadLetter(ctx, dl); err != nil {
+		return fmt.Errorf("failed to add to dead letter queue: %w", err)
 	}
-	m.logger.Info("Sent failed email to dead letter queue", "request ID", deadLetter.OriginalMessage.ID)
-
+	m.logger.Info("stored dead letter", "request ID", deadLetter.OriginalMessage.ID, "attempts", deadLetter.Attempts)
 	return nil
+}
+
+func canDeadLetter(request EmailRequest) bool {
+	return request.ID != "" && request.Service != "" && request.From != "" && request.To != "" && request.Body != ""
+}
+
+func redeliver(err error) error {
+	if err == nil {
+		return ErrRedeliver
+	}
+	return fmt.Errorf("%w: %w", ErrRedeliver, err)
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

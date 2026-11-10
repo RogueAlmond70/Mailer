@@ -81,6 +81,13 @@ func ConnectToDB(ctx context.Context, logger internal.Logger, cfg internal.Confi
 	return pg, nil
 }
 
+func (p *PostgresDB) Close() error {
+	if p == nil || p.DB == nil {
+		return nil
+	}
+	return p.DB.Close()
+}
+
 func (p *PostgresDB) CreateTableIfNotExists(ctx context.Context) error {
 	for _, stmt := range splitSQL(schemaSQL) {
 		if _, err := p.DB.ExecContext(ctx, stmt); err != nil {
@@ -135,7 +142,7 @@ func (p *PostgresDB) StoreEmailRecord(ctx context.Context, data []byte) error {
 		req.Attachment.Inline,
 	)
 	if isUniqueViolation(err) {
-		return fmt.Errorf("email record %s already exists: %w", req.ID, err)
+		return fmt.Errorf("%w: %s", internal.ErrAlreadyStored, req.ID)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to store email record: %w", err)

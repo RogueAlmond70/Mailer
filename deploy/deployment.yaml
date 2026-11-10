@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mailer
+  template:
+    metadata:
+      labels:
+        app: mailer
+    spec:
+      containers:
+        - name: mailer
+          image: mailer:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 8080
+          env:
+            - name: NATS_URL
+              value: nats://nats:4222
+            - name: POSTGRES_HOST
+              value: postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: mailer
+            - name: POSTGRES_PASSWORD
+              value: mailer
+            - name: POSTGRES_DB_NAME
+              value: mailer
+            - name: POSTGRES_SSL_MODE
+              value: disable
+            - name: MAILER_HOST
+              value: smtp
+            - name: MAILER_PORT
+              value: "587"
+            - name: METRICS_ADDR
+              value: ":8080"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailer
+spec:
+  selector:
+    app: mailer
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
